@@ -1,0 +1,254 @@
+import base64
+import requests
+import json
+import mysql.connector
+from collections import defaultdict
+import time
+
+client_id = "2956918655f6b0d052b3c7696aed8cd0d30cd151"
+client_secret = "8fe9c5f45e327b077bb0fa1094eeeaab26113e8562948614e627ebec00d7"
+token_file = "tokens.json"
+
+def get_tokens():
+    try:
+        with open(token_file, "r") as f:
+            tokens = json.load(f)
+        return tokens
+    except FileNotFoundError:
+        return None
+
+def save_tokens(tokens):
+    with open(token_file, "w") as f:
+        json.dump(tokens, f)
+
+def renovar_token(refresh_token):
+    credenciais = f"{client_id}:{client_secret}"
+    credenciais_base64 = base64.b64encode(credenciais.encode()).decode()
+
+    headers = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "Accept": "1.0",
+        "Authorization": f"Basic {credenciais_base64}"
+    }
+
+    dados = {
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token
+    }
+
+    response = requests.post("https://api.bling.com.br/Api/v3/oauth/token", headers=headers, data=dados)
+
+    if response.status_code == 200:
+        token_info = response.json()
+        access_token = token_info["access_token"]
+        refresh_token = token_info["refresh_token"]
+        save_tokens(token_info)
+        return access_token, refresh_token
+    else:
+        print("Erro ao atualizar o Access Token:", response.status_code)
+        print("Resposta recebida:", response.text)
+        return None, None
+
+def atualizar_headers(access_token):
+    global headers
+    headers = {
+        "Authorization": f"Bearer {access_token}",
+        "Content-Type": "application/json"
+    }
+
+# Iniciar o processo de renovação de token e atualização de headers
+tokens = get_tokens()
+
+if tokens:
+    access_token = tokens["access_token"]
+    refresh_token = tokens["refresh_token"]
+    atualizar_headers(access_token)
+else:
+    print("Arquivo de tokens não encontrado ou vazio. É necessário obter um novo authorization code.")
+
+# Datas específicas para buscar vendas
+data_inicial = '2025-03-13'
+data_final = '2025-03-13'
+
+# Função para buscar IDs de vendas com paginação
+def buscar_ids_vendas(pagina=1, limite=200):
+    url_vendas = f"https://www.bling.com.br/Api/v3/pedidos/vendas?pagina={pagina}&limite={limite}&dataInicial={data_inicial}&dataFinal={data_final}"
+    response = requests.get(url_vendas, headers=headers)
+    if response.status_code == 401:  # Token expirado
+        novo_access_token, novo_refresh_token = renovar_token(refresh_token)
+        if novo_access_token and novo_refresh_token:
+            atualizar_headers(novo_access_token)
+            response = requests.get(url_vendas, headers=headers)
+        else:
+            return None
+    if response.status_code == 200:
+        try:
+            dados_vendas = response.json()
+            return dados_vendas
+        except json.JSONDecodeError:
+            print("Erro ao decodificar JSON:", response.text)
+            return None
+    else:
+        print(f"Erro ao obter dados de vendas: {response.status_code}")
+        print(response.text)  # Adicionar para ver a mensagem de erro
+        return None
+
+# Função para buscar detalhes de uma venda
+def buscar_detalhes_venda(id_venda):
+    url_venda = f"https://www.bling.com.br/Api/v3/pedidos/vendas/{id_venda}"
+    tentativas = 3
+    for tentativa in range(tentativas):
+        try:
+            response = requests.get(url_venda, headers=headers)
+            if response.status_code == 401:  # Token expirado
+                novo_access_token, novo_refresh_token = renovar_token(refresh_token)
+                if novo_access_token and novo_refresh_token:
+                    atualizar_headers(novo_access_token)
+                    response = requests.get(url_venda, headers=headers)
+                else:
+                    continue
+            if response.status_code == 200:
+                try:
+                    detalhes_venda = response.json()
+                    return detalhes_venda
+                except json.JSONDecodeError:
+                    print(f"Erro ao decodificar JSON dos detalhes da venda {id_venda}:", response.text)
+                    return None
+            else:
+                print(f"Erro ao obter detalhes da venda {id_venda}: {response.status_code}")
+                print(response.text)  # Adicionar para ver a mensagem de erro
+                return None
+        except requests.exceptions.RequestException as e:
+            print(f"Erro ao tentar conectar: {e}. Tentativa {tentativa + 1} de {tentativas}")
+            time.sleep(5)  # Esperar 5 segundos antes de tentar novamente
+    return None
+
+# Função para mapear situacao_id para situacao_desc
+def mapear_situacao_desc(situacao_id):
+    return {
+        6: 'Em Aberto',
+        9: 'Aprovado',
+        12: 'Cancelado',
+        15: 'Em Andamento',
+        63185: 'Devolvido'
+    }.get(situacao_id, 'Desconhecido')
+
+# Função para mapear loja_id para nome_loja
+def mapear_nome_loja(loja_id):
+    return {
+        203488121: 'Amazon 1',
+        203537354: 'Shopee 1 - CTZ',
+        204523792: 'Shein',
+        203539077: 'Magalu',
+        203596412: 'Mercado Livre 1',
+        203570786: 'Via Varejo (Desabilitada)',
+        203609676: 'Full Mercado Livre',
+        204493983: 'Amazon 2',
+        203490733: 'Americanas (Desabilitada)',
+        204177262: 'Mercado Livre 3',
+        203618108: 'Amazon Pro',
+        203903359: 'Shopee 3 - Gu',
+        204407467: 'Mercado Shops',
+        0: 'Nenhuma',
+        203659946: 'Amazon FBA',
+        204990694: 'Loja Empório CTZ',
+        203488313: 'Mercado Livre 2',
+        205063773: 'Shopee 2 - Cortelux'
+    }.get(loja_id, 'Desconhecido')
+
+# Conectando ao banco de dados
+cnx = mysql.connector.connect(
+    host='localhost',
+    user='root',
+    password='m26r24b19',
+    database='vendas'
+)
+cursor = cnx.cursor()
+
+# Variável para controle de paginação
+pagina = 1
+limite = 200
+vendas_mais_existentes = True
+todos_os_itens = []
+
+# Loop para buscar e inserir vendas
+while vendas_mais_existentes:
+    vendas = buscar_ids_vendas(pagina, limite)
+    if vendas and len(vendas['data']) > 0:
+        print(f"Processando página {pagina}")
+        for venda_resumo in vendas['data']:
+            id_venda = venda_resumo['id']
+            detalhes_venda = buscar_detalhes_venda(id_venda)
+            if detalhes_venda:
+                venda = detalhes_venda['data']
+                situacao_desc = mapear_situacao_desc(venda['situacao']['id'])
+                nome_loja = mapear_nome_loja(venda['loja']['id'])
+
+                # Verificar se valorBase está presente nas taxas
+                valor_base = venda.get('taxas', {}).get('valorBase', 0.0)
+
+                # Agrupar itens pela quantidade e calcular o valor total por item
+                itens_agrupados = defaultdict(lambda: defaultdict(int))
+                for item in venda['itens']:
+                    chave_item = (venda['numero'], item['codigo'])
+                    itens_agrupados[chave_item]['numero'] = venda['numero']
+                    itens_agrupados[chave_item]['numeroLoja'] = venda['numeroLoja']
+                    itens_agrupados[chave_item]['data'] = venda['data']
+                    itens_agrupados[chave_item]['situacao_desc'] = situacao_desc
+                    itens_agrupados[chave_item]['nome_loja'] = nome_loja
+                    itens_agrupados[chave_item]['item_codigo'] = item['codigo']
+                    itens_agrupados[chave_item]['item_unidade'] = item['unidade']
+                    itens_agrupados[chave_item]['item_quantidade'] += item['quantidade']
+                    itens_agrupados[chave_item]['item_valor'] = item['valor'] * itens_agrupados[chave_item]['item_quantidade']
+                    itens_agrupados[chave_item]['item_descricao'] = item['descricao']
+                    itens_agrupados[chave_item]['taxaComissao'] = venda.get('taxas', {}).get('taxaComissao', 0.0)
+                    itens_agrupados[chave_item]['custoFrete'] = venda.get('taxas', {}).get('custoFrete', 0.0)
+                    itens_agrupados[chave_item]['valorBase'] = valor_base
+                
+                for chave_item, item_detalhe in itens_agrupados.items():
+                    todos_os_itens.append(item_detalhe)
+
+                    cursor.execute('''
+                    INSERT INTO vendas_detalhes (
+                        numero, numeroLoja, data, situacao_desc, nome_loja, 
+                        item_codigo, item_unidade, item_quantidade, item_valor, 
+                        item_descricao, taxaComissao, custoFrete, valorBase)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                    ON DUPLICATE KEY UPDATE 
+                        numeroLoja=VALUES(numeroLoja), data=VALUES(data), 
+                        situacao_desc=VALUES(situacao_desc), nome_loja=VALUES(nome_loja),
+                        item_codigo=VALUES(item_codigo), item_unidade=VALUES(item_unidade), 
+                        item_quantidade=VALUES(item_quantidade), item_valor=VALUES(item_valor), 
+                        item_descricao=VALUES(item_descricao), taxaComissao=VALUES(taxaComissao), 
+                        custoFrete=VALUES(custoFrete), valorBase=VALUES(valorBase)
+                    ''', (
+                        item_detalhe['numero'], item_detalhe['numeroLoja'], item_detalhe['data'], item_detalhe['situacao_desc'], item_detalhe['nome_loja'],
+                        item_detalhe['item_codigo'], item_detalhe['item_unidade'], item_detalhe['item_quantidade'], item_detalhe['item_valor'], 
+                        item_detalhe['item_descricao'], item_detalhe['taxaComissao'], item_detalhe['custoFrete'], item_detalhe['valorBase']
+                    ))
+
+                # Confirmar as alterações a cada venda detalhada
+                cnx.commit()
+        print(f"Alterações confirmadas para a página {pagina}")
+        pagina += 1  # Ir para a próxima página
+        time.sleep(1)  # Aguardar 1 segundo entre as solicitações para evitar erro 429
+    else:
+        vendas_mais_existentes = False  # Nenhum dado encontrado, encerrar a paginação
+
+# Fechar a conexão
+cursor.close()
+cnx.close()
+
+print("Todas as vendas detalhadas foram inseridas no banco de dados.")
+
+
+
+
+
+
+
+
+
+
+
+
